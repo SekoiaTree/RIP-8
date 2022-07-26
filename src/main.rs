@@ -1,3 +1,5 @@
+mod debugger;
+
 use std::collections::HashMap;
 use std::{env, mem};
 use std::fs::File;
@@ -40,70 +42,79 @@ fn main() {
         .position_centered()
         .build()
         .expect("Failed to create window");
+    let dbg_window = video_subsystem.window("Debug", 1024, 512)
+        .position_centered()
+        .build()
+        .expect("Failed to create window");
+    let dbg_id = dbg_window.id();
 
-    let mut canvas = window.into_canvas().build().expect("Failed to create canvas");
+        let mut canvas = window.into_canvas().build().expect("Failed to create canvas");
+        let mut dbg_canvas = dbg_window.into_canvas().build().expect("Failed to create canvas");
 
-    canvas.set_draw_color(Color::RGB(0, 0, 0));
-    canvas.clear();
-    canvas.present();
+        canvas.set_draw_color(Color::RGB(0, 0, 0));
+        canvas.clear();
+        canvas.present();
+        dbg_canvas.set_draw_color(Color::RGB(0, 0, 0));
+        dbg_canvas.clear();
+        dbg_canvas.present();
 
-    let mut event_pump = sdl_context.event_pump().expect("Failed to create event pump");
+        let mut event_pump = sdl_context.event_pump().expect("Failed to create event pump");
 
 
-    let audio = create_audio();
+        let audio = create_audio();
 
-    let mut machine = Machine::new(audio.map(|(x, y, sink)| {
-        mem::forget(x);
-        mem::forget(y);
-        sink
-    }));
+        let mut machine = Machine::new(audio.map(|(x, y, sink)| {
+            mem::forget(x);
+            mem::forget(y);
+            sink
+        }));
 
-    let path = env::args().skip(1).next().expect("No input file.");
-    let file = File::open(path).expect("Could not open file.");
-    machine.load_program(file);
-    'main: loop {
-        machine.cycle();
-        if machine.draw_flag {
-            canvas.set_draw_color(Color::RGB(0, 0, 0));
-            canvas.clear();
-            for x in 0..64 {
-                for y in 0..32 {
-                    if machine.screen[y * 64 + x] {
-                        canvas.set_draw_color(Color::RGB(255, 255, 255));
-                        let rect = sdl2::rect::Rect::new((x * 16) as i32, (y * 16) as i32, 16, 16);
-                        canvas.fill_rect(rect).expect("Failed to draw");
+        let path = env::args().skip(1).next().expect("No input file.");
+        let file = File::open(path).expect("Could not open file.");
+        machine.load_program(file);
+        let mut debugger = debugger::Debugger::new(machine);
+        'main: loop {
+            debugger.cycle(&mut canvas, Some(&mut dbg_canvas));
+
+
+            for event in event_pump.poll_iter() {
+                if event.get_window_id() == Some(dbg_id) {
+                    match event {
+                        Event::Quit {..} |
+                        Event::KeyDown { keycode: Some(Keycode::Escape), .. } => {
+                            break 'main;
+                        }
+                        Event::KeyDown { keycode: Some(Keycode::Space), .. } => {
+                            debugger.toggle_pause();
+                        }
+                        Event::KeyDown { keycode: Some(Keycode::Tab), .. } => {
+                            debugger.step();
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match event {
+                        Event::Quit { .. } |
+                        Event::KeyDown { keycode: Some(Keycode::Escape), .. } => {
+                            break 'main;
+                        }
+                        Event::KeyDown { keycode: Some(x), .. } => {
+                            if let Some(key) = DEFAULT_MAPPINGS.get(&x) {
+                                debugger.key_pressed(*key);
+                            }
+                        }
+                        Event::KeyUp { keycode: Some(x), .. } => {
+                            if let Some(key) = DEFAULT_MAPPINGS.get(&x) {
+                                debugger.key_released(*key);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
-            canvas.present();
 
-            machine.draw_flag = false;
-            machine.draw_complete();
+            std::thread::sleep(Duration::new(0, 1_000_000_000u32 / 240));
         }
-
-
-        for event in event_pump.poll_iter() {
-            match event {
-                Event::Quit { .. } |
-                Event::KeyDown { keycode: Some(Keycode::Escape), .. } => {
-                    break 'main;
-                }
-                Event::KeyDown { keycode: Some(x), .. } => {
-                    if let Some(key) = DEFAULT_MAPPINGS.get(&x) {
-                        machine.key_pressed(*key);
-                    }
-                }
-                Event::KeyUp { keycode: Some(x), .. } => {
-                    if let Some(key) = DEFAULT_MAPPINGS.get(&x) {
-                        machine.key_released(*key);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        std::thread::sleep(Duration::new(0, 1_000_000_000u32 / 240));
-    }
 }
 
 const TIMER_DIVIDER : u8 = 4;
@@ -394,8 +405,8 @@ impl Machine {
         let y = ((v & 0x00F0) >> 4) as usize;
 
         let (result, overflow) = self.registers[x].overflowing_add(self.registers[y]);
-        self.registers[x] = result;
         self.registers[0xF] = overflow as u8;
+        self.registers[x] = result;
     }
 
     fn sub_reg(&mut self, v: OpCode) {
@@ -403,8 +414,8 @@ impl Machine {
         let y = ((v & 0x00F0) >> 4) as usize;
 
         let (result, overflow) = self.registers[x].overflowing_sub(self.registers[y]);
+        self.registers[0xF] = (!overflow) as u8;
         self.registers[x] = result;
-        self.registers[0xF] = overflow as u8;
     }
 
     fn shift_right(&mut self, v: OpCode) {
@@ -415,7 +426,7 @@ impl Machine {
 
     fn shift_left(&mut self, v: OpCode) {
         let x = ((v & 0x0F00) >> 8) as usize;
-        self.registers[0xF] = self.registers[x] & 0x80;
+        self.registers[0xF] = self.registers[x] >> 7;
         self.registers[x] <<= 1;
     }
 
@@ -424,8 +435,8 @@ impl Machine {
         let y = ((v & 0x00F0) >> 4) as usize;
 
         let (result, overflow) = self.registers[y].overflowing_sub(self.registers[x]);
+        self.registers[0xF] = (!overflow) as u8;
         self.registers[x] = result;
-        self.registers[0xF] = overflow as u8;
     }
 
     fn cond_neq_reg(&mut self, v: OpCode) {
@@ -467,13 +478,13 @@ impl Machine {
                 let sprite_x = base_x + j;
                 let pixel = (sprite >> (7 - j)) & 0x1;
                 let pixel_index = sprite_y * 64 + sprite_x;
-                if pixel_index >= self.screen.len() {
+                if pixel_index >= self.screen.len() || pixel == 0 {
                     continue;
                 }
-                if pixel == 1 && self.screen[pixel_index] {
+                if self.screen[pixel_index] {
                     self.registers[0xF] = 1;
                 }
-                self.screen[pixel_index] = (pixel == 1) != self.screen[pixel_index];
+                self.screen[pixel_index] = !self.screen[pixel_index];
             }
         }
 
@@ -483,8 +494,10 @@ impl Machine {
     fn cond_key(&mut self, v: OpCode) {
         if v & 0x00FF == 0x009E {
             self.cond_key_pressed(v);
-        } else {
+        } else if v & 0x00FF == 0x00A1 {
             self.cond_key_not_pressed(v);
+        } else {
+            self.invalid_opcode(v);
         }
     }
 
@@ -543,14 +556,15 @@ impl Machine {
     fn set_sound(&mut self, v: OpCode) {
         let x = ((v & 0x0F00) >> 8) as usize;
         self.sound_timer = self.registers[x];
-        if let Some(x) = &mut self.audio {
-            x.play();
+        if self.sound_timer != 0 {
+            if let Some(x) = &mut self.audio {
+                x.play();
+            }
         }
     }
 
     fn add_index(&mut self, v: OpCode) {
-        self.index_register += v & 0x0FFF;
-        self.registers[0xF] = if self.index_register > 0xFFF { 1 } else { 0 };
+        self.index_register += self.registers[v as usize & 0x0F00 >> 8] as u16;
     }
 
     fn set_index_char(&mut self, v: OpCode) {
